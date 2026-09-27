@@ -1,7 +1,11 @@
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { WORKER_CONCURRENCY, POLL_INTERVAL_MS } from "@/config";
+import { WORKER_CONCURRENCY, POLL_INTERVAL_MS, HEARTBEAT_INTERVAL_MS } from "@/config";
 import { nextRunAt } from "./backoff";
 import { sendEmailJob } from "./email";
+import { WORKER_INSTANCE_ID, reportLeaseRejection } from "./lease";
 
 type ClaimedJob = {
   id: string;
@@ -99,7 +103,15 @@ async function main(): Promise<void> {
   setInterval(tick, POLL_INTERVAL_MS);
 }
 
-main().catch((err) => {
-  console.error("[worker] fatal:", err);
-  process.exit(1);
-});
+// Only start the poll loop when this file is run as a program. Tests import
+// `withHeartbeat` from here and must not kick off a competing worker.
+const isDirectRun = process.argv[1]
+  ? realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))
+  : false;
+
+if (isDirectRun) {
+  main().catch((err) => {
+    console.error("[worker] fatal:", err);
+    process.exit(1);
+  });
+}
