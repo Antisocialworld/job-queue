@@ -30,12 +30,26 @@ model Job {
   lastError      String?
   runAt          DateTime  @default(now())
   startedAt      DateTime?
+  lastHeartbeat  DateTime?
   finishedAt     DateTime?
   idempotencyKey String    @unique
   createdAt      DateTime  @default(now())
+
+  // Optimistic concurrency for the claim. Incremented by the atomic claim, so
+  // the pair (leaseVersion, workerInstanceId) identifies exactly one claim.
+  // A worker whose completion write is guarded on its own leaseVersion and
+  // matches 0 rows knows it was reclaimed out from under it.
+  leaseVersion        Int     @default(0)
+  workerInstanceId    String?
+
+  // Set when a possible duplicate real send was detected. Deliberately NOT
+  // auto-remediated: the risk is recorded for a human to review, not undone.
+  possibleDuplicateSend Boolean @default(false)
+
   emailLog       EmailLog?
 
   @@index([status, runAt])
+  @@index([status, lastHeartbeat])
   @@map("Job")
 }
 
