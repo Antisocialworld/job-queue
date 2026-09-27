@@ -1,0 +1,51 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum JobStatus {
+  pending
+  processing
+  succeeded
+  failed
+  dead
+}
+
+enum EmailSendState {
+  sending
+  sent
+}
+
+model Job {
+  id             String    @id @default(cuid())
+  type           String
+  payload        Json
+  status         JobStatus @default(pending)
+  attempts       Int       @default(0)
+  maxAttempts    Int
+  lastError      String?
+  runAt          DateTime  @default(now())
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  idempotencyKey String    @unique
+  createdAt      DateTime  @default(now())
+  emailLog       EmailLog?
+
+  @@index([status, runAt])
+  @@map("Job")
+}
+
+model EmailLog {
+  id        String         @id @default(cuid())
+  jobId     String         @unique
+  state     EmailSendState @default(sending)
+  sentAt    DateTime?
+  createdAt DateTime       @default(now())
+  job       Job            @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@map("EmailLog")
+}
