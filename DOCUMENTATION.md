@@ -85,11 +85,17 @@ Useful endpoints:
    `maxAttempts`. Below → back to `pending`, `runAt = now + base * 2^attempts + jitter` (jitter up to 30%). At/above → `dead`, `finishedAt=now`.
    `dead` means "retries exhausted, needs a human"; it is not the same
    as `failed`.
-6. **Stuck jobs.** The sweep (separate process, one-shot,
-   `worker/sweep.ts`) resets any job stuck `processing` for longer than
-   `STUCK_TIMEOUT_MS` (read from the real config module `config.ts`,
-   not a hardcoded literal) back to `pending` with attempts
-   incremented once.
+6. **Overlong jobs, capped by wall-clock duration.** A second, independent
+   mechanism (`worker/overlong.ts`) reclaims any `processing` job whose real
+   duration `now - startedAt` exceeds `MAX_JOB_DURATION_MS`, *regardless of
+   whether its heartbeat is still current*. It reclaims to `pending` with
+   `attempts` incremented once and a real `lastError`. See §4b.
+7. **Stuck jobs, detected by heartbeat.** The sweep (separate process,
+   one-shot, `worker/sweep.ts`) resets any job whose worker has stopped
+   beating to `pending` with attempts incremented once. Liveness is measured
+   from `Job.lastHeartbeat`, **not** from `startedAt` — see §4a. The timeout
+   is `STUCK_TIMEOUT_MS` (read from the real config module `config.ts`, not a
+   hardcoded literal).
 7. **Dead-letter view.** `/dead-letter` lists `dead` jobs with payload +
    lastError and a manual retry button that POSTs to the retry route.
    The retry keeps the honest attempt count and simply re-queues the job
@@ -103,14 +109,280 @@ In short:
 - `Job` — the work lifecycle. Cuid id, `type`, JSON `payload`, one of
   `pending`/`processing`/`succeeded`/`failed`/`dead`, `attempts`,
   `maxAttempts` (from config, snapshotted), `lastError`, `runAt`,
-  `startedAt`, `finishedAt`, unique `idempotencyKey`,
-  index `(status, runAt)` for the claim query.
+   `startedAt`, `lastHeartbeat`, `finishedAt`, unique `idempotencyKey`,
+   index `(status, runAt)` for the claim query, plus
+   `(status, lastHeartbeat)` for the sweep query. Also `leaseVersion`,
+   `workerInstanceId` and `possibleDuplicateSend` — see section 4c.
 - `EmailLog` — one row per job (`jobId` unique, FK, cascade delete).
   Owns the *proven* send state: `state` is `sending` (written before
   the provider is ever called) or `sent` (flipped only after a real,
   successful send, recording real `sentAt`).
 
 Enums: `JobStatus`, `EmailSendState` are real Postgres enums.
+
+## 4a. `lastHeartbeat`: liveness, not elapsed time
+**The bug this replaces.** The sweep used to decide a job was stuck purely
+from `startedAt`: any job that had been `processing` for longer than
+`STUCK_TIMEOUT_MS` was reset to `pending`. That conflates *"has been open a
+long time"* with *"nobody is working on it"*. A worker that is alive and
+healthy but slow — Gmail's SMTP server taking unusually long, a large
+payload — keeps its claim while the sweep resets the job out from under it.
+The job becomes claimable a second time, and the same email can be sent
+twice.
+
+**The mechanism.** `Job.lastHeartbeat DateTime?` is a liveness signal, not a
+duration:
+
+- The atomic claim stamps `lastHeartbeat = NOW()` alongside
+  `startedAt = NOW()`.
+- While a job is in flight, the worker refreshes `lastHeartbeat` every
+  `HEARTBEAT_INTERVAL_MS` (`withHeartbeat` in `worker/worker.ts`), including
+  one immediate beat before the work starts.
+- The sweep resets a job only when `lastHeartbeat` is **older than
+  `STUCK_TIMEOUT_MS`**. A slow-but-alive worker keeps beating, so its job is
+  never reclaimed no matter how long it has been open.
+
+**Why the interval is derived, not hardcoded.** `HEARTBEAT_INTERVAL_MS`
+defaults to `STUCK_TIMEOUT_MS / 6` — 10s against the default 60s timeout. A
+worker must therefore miss ~6 consecutive beats before the sweep will touch
+its job, so the margin is structural rather than a coin-flip against timer
+scheduling. Override it only if you keep it under `STUCK_TIMEOUT_MS / 3`.
+
+**A late beat cannot resurrect a reclaimed job.** The heartbeat update is
+guarded on `status = 'processing'`, so if the sweep has already reclaimed a
+job, a straggler beat from the original worker is a no-op instead of
+refreshing the heartbeat of a job that is back in the queue.
+
+**NULL-safety, deliberately.** A plain `lastHeartbeat < cutoff` filter would
+be a trap: in SQL, comparing `NULL` with `<` yields `NULL`, never true, so
+every job with no heartbeat would sit `processing` *forever*. The sweep
+therefore matches `lastHeartbeat < cutoff` **or** (`lastHeartbeat IS NULL`
+**and** `startedAt < cutoff`). Rows with no heartbeat can only predate this
+column, so they fall back to the old `startedAt` rule and still get
+reclaimed.
+
+**Unchanged.** This is a change to *detection timing* only. The unique
+constraints (`Job.idempotencyKey_key`, `EmailLog.jobId_key`), the
+`sending`→`sent` state machine, and the `FOR UPDATE SKIP LOCKED` claim are all
+exactly as they were.
+
+## 4b. The three timeouts, and why they are three
+
+A heartbeat answers "is the process alive?", which is not the same question as
+"is this job making progress?". A job stuck in an infinite loop, or waiting on
+a call that never times out, keeps beating happily forever and would hold a
+worker slot for the life of the process. Liveness alone therefore cannot bound
+how long a single attempt may run. There are three separate settings, and
+conflating any two of them reintroduces a real bug:
+
+| Setting | Question it answers | Signal | Default | Detects |
+|---|---|---|---|---|
+| `HEARTBEAT_INTERVAL_MS` | How often is liveness *proven*? | cadence, not a threshold | `STUCK_TIMEOUT_MS / 6` = 10000 | nothing by itself |
+| `STUCK_TIMEOUT_MS` | Has the worker **stopped beating**? | `lastHeartbeat` age | 60000 | dead / crashed worker |
+| `MAX_JOB_DURATION_MS` | Has this job run **too long at all**? | `startedAt` age | 20000 | hung-but-alive job |
+
+- **`HEARTBEAT_INTERVAL_MS`** is a cadence, not a limit. It only controls how
+  often `lastHeartbeat` is refreshed, and therefore how much slack
+  `STUCK_TIMEOUT_MS` needs in order to tolerate missed beats. It is derived as
+  `STUCK_TIMEOUT_MS / 6` so ~6 consecutive beats must be missed before the
+  dead-worker check fires.
+- **`STUCK_TIMEOUT_MS` (60s)** is the *dead worker* check. It reads
+  `lastHeartbeat`, never `startedAt`. A slow-but-alive worker keeps beating
+  and is left alone, however long it has been open.
+- **`MAX_JOB_DURATION_MS` (20s)** is the *hard ceiling*, and it reads
+  `startedAt` and deliberately **never consults `lastHeartbeat`**. A fresh
+  heartbeat cannot buy a hung job more time. A real successful Gmail SMTP
+  send finishes well under 5s, so 20s is generous headroom for network
+  slowness while still being meaningfully tighter than the 60s dead-worker
+  timeout — the ceiling gets first refusal on a job that is both hung and
+  stale.
+
+**Enforced invariant, not a convention.** `config.ts` throws at load time if
+`MAX_JOB_DURATION_MS > STUCK_TIMEOUT_MS`, naming both values and the required
+ordering. The relation is load-bearing: if the ceiling were looser than the
+dead-worker timeout, a hung-but-alive job would sit untouched until the far
+longer heartbeat check, and the ceiling could never fire. Silently continuing
+would produce a config that looks valid and behaves wrongly, so it fails loudly
+at startup instead (verified: non-zero exit, real message).
+
+**Why they are two mechanisms and not one condition.** The queries are
+separate functions in separate modules (`worker/sweep.ts` and
+`worker/overlong.ts`) with their own predicates and their own log lines, and
+each is independently testable. Folding them into a single `OR` would be
+wrong twice over: it would destroy the distinct log evidence for *which*
+failure mode fired, and it would let one job satisfy both clauses at once,
+hiding the fact that two independent problems existed. `npm run sweep` runs
+the ceiling first, then the heartbeat check.
+
+**Reclaim semantics, and why not straight to `dead`.** An overlong job goes
+back to `pending` with `attempts` incremented once and a real `lastError`,
+exactly as the dead-worker sweep does. A job that hung once because of a
+transient network fault should get another attempt; one that hangs every time
+exhausts `maxAttempts` and lands in `dead` for a human, bounded by the
+existing backoff. Sending it straight to `dead` would discard a legitimately
+transient failure.
+
+**Known interaction.** `WORKER_TEST_SLEEP_MS` (default 300ms) deliberately holds
+a claim open in test mode. Setting it above `MAX_JOB_DURATION_MS` will make
+the ceiling reclaim that job — which is the cap working as designed, but worth
+knowing before using a long sleep to simulate a slow send.
+
+
+## 4c. `leaseVersion`: detecting work that lost its job
+**The bug this replaces.** Both reclaim mechanisms above can take a job back
+while the original worker is still running — that is the entire point of them.
+Before the lease, that worker's completion write was an unconditional
+`update({ where: { id } })`, so it landed *on top of* the new holder's row: the
+loser overwrote the winner's `status`, and if the loser had already made a real
+irreversible SMTP call, the duplicate was invisible. The system had no way to
+tell a legitimate completion from a stale one, so it silently believed both.
+
+**The mechanism.** Three columns, all real and migrated:
+
+- `leaseVersion Int @default(0)` — incremented by the claim itself, in the same
+  `UPDATE ... FOR UPDATE SKIP LOCKED` statement that transfers the job, so
+  ownership transfer and version bump are one indivisible database operation.
+  `RETURNING` hands the worker the exact version it now owns.
+- `workerInstanceId String?` — a per-process UUID (`worker-<uuid>`, logged at
+  startup) stamped by the same claim, naming *which* process holds the lease.
+- `possibleDuplicateSend Boolean @default(false)` — durable evidence that a real
+  send may have been duplicated, for a human to review.
+
+Every completion write — success, retry, dead, and the `EmailLog`
+`sending -> sent` flip — is an `updateMany` guarded on
+`{ id, leaseVersion: <mine> }`. Matching 0 rows means the lease was lost. That
+is a detection, not a retry: the write is discarded, never re-queued, because
+re-queuing is exactly what could place a second real send.
+
+**The reclaim invalidates the lease too.** Both `reclaimOverlongJobs` and
+`sweepStuckJobs` bump `leaseVersion` and null `workerInstanceId` as part of the
+reclaim. This is load-bearing and easy to miss: if only the claim bumped the
+version, then in the window between a reclaim and the next claim the old
+worker's lease would *still match*, and a late completion could resurrect a job
+that had just been taken back. Invalidating at reclaim time means the stale
+worker is caught immediately, even if nobody ever re-claims the job. The lease
+rejection test asserts this window specifically.
+
+**The audit event, and what it deliberately does not do.** A rejected write logs
+one greppable line naming the `jobId`, the rejected worker's own
+`workerInstanceId`, the expected and actual `leaseVersion`, the observed status,
+and the write that was discarded, then sets `possibleDuplicateSend=true`. It
+writes only that boolean — deliberately *not* `status` and *not* `lastError`,
+because the loser has no right to overwrite the current holder's real state.
+The write is unconditional precisely because the worker that lost the race is
+the only one holding the evidence.
+
+**No compensation, on purpose.** There is no retraction email and no attempt to
+un-send. A duplicate may genuinely have been delivered, and pretending to fix it
+would be worse than saying so. `possibleDuplicateSend=true` is the honest
+record. Note the flag is *possible* duplicate, not *confirmed* duplicate: the
+lease proves a send may have been duplicated, not that the provider delivered
+it twice.
+
+**`EmailLog` unique violations take the same path.** `sendEmailJob` does
+check-then-act (`findUnique`, then `create`), so two workers can both pass the
+check. The real `EmailLog_jobId_key` unique index is the arbiter: the loser's
+`P2002` is caught *specifically* (not as a generic error) so it is never
+re-queued into a resent email.
+
+**How bad was it, verified rather than asserted.** Two throwaway diagnostics
+against real Postgres, real `sendEmailJob`, real `WORKER_TEST_DISABLE_SEND=1`:
+
+1. Two concurrent `sendEmailJob` calls: **12 of 12 rounds** collided with a real
+   unique violation, each round with exactly one send. The loser's violation
+   propagated as a plain `Error` into `runJob`'s catch-all, which re-queued the
+   job as `pending` with backoff.
+2. With the row still in `sending` when the retry lands — i.e. the winner is
+   still mid-SMTP, which is this system's normal failure mode — the retry
+   **did place a second real send** (`send attempts made by the retry: 1`,
+   returned `state: "sent"`).
+
+An honest qualifier on severity: the duplicate did *not* appear in the 12-round
+concurrent test, because the winner finished before the retry fired. It requires
+the winner to still be mid-send. So this was a genuine but timing-dependent
+duplicate, not a certainty — and it is invisible without the audit flag, which
+is why the flag exists.
+
+
+## 4d. Two arbiters, one outcome: the insert race vs the lease guard
+**The gap the lease work introduced.** Adding the lease created a *second*
+arbitrator. `EmailLog` is arbitrated by the unique index on `jobId`; `Job`
+terminal state is arbitrated by `leaseVersion`. Nothing coupled them, and they
+genuinely disagreed. Losing the insert race and holding the valid lease are
+independent facts that can belong to different workers.
+
+**How it diverged.** A worker slower than `MAX_JOB_DURATION_MS` gets reclaimed
+by the duration cap while still mid-SMTP; B claims the job and holds the valid
+lease; both then race the `EmailLog` insert. Nothing in `sendEmailJob` consults
+the lease before that insert, so the race is decided purely by timing. Forced
+into that interleaving, the stale worker won the insert in **7 of 12 rounds**.
+
+When it did, the two arbiters pointed in opposite directions and *both workers
+declined to act*:
+
+- the stale worker owned the `EmailLog` row, but its `sending -> sent` flip was
+  lease-guarded and therefore rejected — so a real, irreversible send was
+  **silently discarded**, leaving the row at `sending`;
+- the valid lease-holder had the sole authority to write terminal state, but
+  lost the insert, so it returned `deferred` and wrote nothing.
+
+`Job.status` stayed `processing`, `EmailLog` stayed `sending`, and the next
+claimer read that stale row as an unconfirmed attempt and **sent a duplicate**.
+The lease work did not prevent the duplicate here; it manufactured one. The
+root cause is a category error: the `sending -> sent` flip was treated as a
+scheduling decision when it is a record of a real-world fact.
+
+**The fix, in three parts.**
+
+1. **The flip is no longer lease-guarded.** A delivery that happened is a fact
+   about the world, not a scheduling decision. The lease says who is
+   responsible for the job right now; it says nothing about whether the email
+   was sent. `EmailLog_jobId_key` already guarantees exactly one worker owns the
+   row, so the lease adds nothing there. The flip is now a plain
+   `updateMany({ jobId, state: 'sending' })`. If the lease has since been lost,
+   the send is flagged as a possible duplicate *and still recorded* — discarding
+   a real send to keep a clean log is precisely the bug.
+2. **The insert-race loser no longer abandons the job.** It is usually the
+   current lease-holder, and therefore the only worker allowed to write the
+   terminal status. So instead of returning immediately, it waits up to
+   `DUPLICATE_SEND_CONFIRM_MS` (default 2000) to see whether the peer really
+   delivered. If the row reaches `sent`, it reports `alreadySent` and its
+   lease-guarded completion write records `succeeded` — no second send. Only a
+   row still `sending` after the budget is genuine uncertainty, and only then
+   does it defer, writing nothing.
+3. **The heartbeat is lease-guarded, and the flag stopped crying wolf.** Every
+   other write in the system is lease-guarded; `withHeartbeat` was the one
+   exception, guarding only on `status = 'processing'`. So a worker that had
+   lost its lease kept beating on the *new* holder's job — its beats matched,
+   because the new holder had set the row back to `processing` — masking a job
+   nobody was working on from the liveness sweep. It is now guarded on
+   `leaseVersion` too. Separately, a worker that lost the insert race provably
+   never reached `sendRealEmail`, so it can never have caused a duplicate and no
+   longer sets `possibleDuplicateSend`; that flag now fires only when a real
+   send genuinely happened under a stale lease.
+
+**Result, forced through the same 7/12 divergence scenario, 16 real rounds**
+(`tests/send-race-divergence.test.ts`, real Postgres, real claim/reclaim/send):
+
+| | before | after |
+|---|---|---|
+| divergent rounds | 7 of 12 | 11 of 16 (race still happens — it is not suppressed, only resolved correctly) |
+| real sends per round | 1, plus **1 duplicate on the next claim** | **exactly 1, every round** |
+| `EmailLog` at end | `sending` (send lost) or `sent` | **`sent`, every round** |
+| `Job.status` at end | `processing`, `succeededBy=NOBODY` | **`succeeded`, every round** |
+| who wrote `succeeded` | nobody; convergence required a *second send* | **the valid lease-holder, under its own valid lease** |
+| duplicate flag, aligned race | fired (false positive) | **does not fire** |
+
+The stale worker is still refused the right to write `Job` state in every round
+(`writesA=0` throughout) — that part of the lease was correct and stays. The
+change is that the *send* it performed is now recorded, and the worker actually
+authorised to close the job is the one that closes it.
+
+Genuine uncertainty is preserved, not papered over: with a stub peer that
+inserts a row and never confirms a send, the lease-holder still defers, places
+no send, writes nothing, leaves `EmailLog` honestly at `sending`, and sets no
+duplicate flag (exercised 6 of 6).
+
 
 ## 5. The Concepts
 
@@ -287,3 +559,58 @@ simultaneously (6 claims in flight at the cap). Final DB truth:
 claimed twice), `emailLogRowsForT5=20` (each job processed exactly
 once). `FOR UPDATE SKIP LOCKED` arbitration held; no application-level
 locks were used.
+
+**Test 6 — forced lease rejection, verified (`tests/lease-rejection.test.ts`).**
+27 checks, all passing, against real Postgres using the real claim statement,
+the real `reclaimOverlongJobs`, and the real guarded completion write. A job is
+claimed by worker A, left to exceed `MAX_JOB_DURATION_MS`, reclaimed for real,
+then re-claimed by worker B — and A is still told to complete:
+
+- case 1 — the real reclaim bumped `leaseVersion` `1 -> 2` and nulled
+  `workerInstanceId`; A's late write matched `0` rows **with no re-claim
+  present**, and the job stayed `pending` rather than being resurrected. This
+  is the reclaim-time invalidation window.
+- case 2 — B's claim took the version to `3`; A's completion still matched
+  `0` rows, left `status=processing` and `workerInstanceId=worker-B-instance`
+  untouched, and the audit then set `possibleDuplicateSend=true` without
+  overwriting B's `lastError`.
+- case 3 — the warning was asserted field by field: `jobId`,
+  `rejectedWorkerInstanceId=worker-A-instance`,
+  `leaseVersionMismatch expected=1 actual=3`, `observedStatus=processing`, the
+  `DISCARDED (lease lost)` companion line, and the explicit
+  `NOT compensating` wording.
+- case 4 — an uncontested job still completes normally
+  (`count=1`, `status=succeeded`, no duplicate flag), so the guard is not
+  simply blocking writes.
+
+Also re-run and still passing after the lease landed:
+`tests/overlong.test.ts` (15 checks) and `tests/sweep-heartbeat.test.ts`
+(14 checks, including that `Job_idempotencyKey_key` and `EmailLog_jobId_key`
+still exist and still reject duplicates). Project-code typecheck: 0 errors
+outside generated `.next`. `npm run lint`: clean.
+
+**Test 7 — send-race divergence, the fix for the bug the lease introduced
+(`tests/send-race-divergence.test.ts`).** 118 checks, all passing, 16 forced
+divergence rounds plus 6 genuine-uncertainty rounds, real Postgres. Reproduces
+the exact interleaving that produced 7/12 duplicates before the fix: a job
+claimed by A, left past `MAX_JOB_DURATION_MS`, reclaimed for real, re-claimed
+by B, then raced through the real `sendEmailJob`.
+
+- **16 of 16 rounds: exactly one real send.** `totalSends=16 over 16 rounds`.
+- **16 of 16 rounds: `EmailLog=sent` and `Job=succeeded`**, with no second claim
+  needed — convergence came from recording the existing send, not a new one.
+- **16 of 16 rounds: `writesB=1, writesA=0`** — the terminal status was written
+  by the valid lease-holder under its own lease, and the stale worker wrote
+  nothing to the job row.
+- The race still genuinely happens (**11 divergent / 5 aligned**). The fix does
+  not suppress the race; it resolves both outcomes correctly.
+- All 5 aligned rounds: `dupFlag=false` — the false positive is gone.
+  All 11 divergent rounds: `dupFlag=true`, which is correct, because the stale
+  worker really did place a send under a dead lease.
+- Genuine uncertainty (stub peer inserts, never confirms): 6 of 6 deferred with
+  `sends=0`, `writes=0`, `EmailLog=sending`, `Job=processing`, `dupFlag=false` —
+  honest uncertainty preserved, no send, no retry, no false flag.
+
+Also added: `tests/lease-rejection.test.ts` case 5 drives the real
+`withHeartbeat` and proves a stale lease **cannot** refresh the heartbeat
+(`lastHeartbeat` stayed at epoch 0) while the current lease can.
